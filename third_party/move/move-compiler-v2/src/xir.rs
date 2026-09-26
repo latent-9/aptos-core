@@ -1015,6 +1015,33 @@ fn called_functions(
     Ok(called)
 }
 
+/// The XIR width of a model type, if it is a Move integer.
+fn int_type_of(ty: &Type) -> Option<IntType> {
+    let Type::Primitive(primitive) = ty else {
+        return None;
+    };
+    match primitive {
+        PrimitiveType::U8 => Some(IntType::U8),
+        PrimitiveType::U16 => Some(IntType::U16),
+        PrimitiveType::U32 => Some(IntType::U32),
+        PrimitiveType::U64 => Some(IntType::U64),
+        PrimitiveType::U128 => Some(IntType::U128),
+        PrimitiveType::U256 => Some(IntType::U256),
+        PrimitiveType::I8 => Some(IntType::I8),
+        PrimitiveType::I16 => Some(IntType::I16),
+        PrimitiveType::I32 => Some(IntType::I32),
+        PrimitiveType::I64 => Some(IntType::I64),
+        PrimitiveType::I128 => Some(IntType::I128),
+        PrimitiveType::I256 => Some(IntType::I256),
+        PrimitiveType::Bool
+        | PrimitiveType::Address
+        | PrimitiveType::Signer
+        | PrimitiveType::Num
+        | PrimitiveType::Range
+        | PrimitiveType::EventStore => None,
+    }
+}
+
 fn struct_at(structs: &[StructId], id: usize, function: &str) -> Result<StructId> {
     structs
         .get(id)
@@ -1213,6 +1240,22 @@ impl FunctionTranslator<'_> {
         self.local_types
             .get(id)
             .with_context(|| format!("local l{id} is out of range in `{}`", self.decl.name))
+    }
+
+    /// Checks that local `id` has the annotated width. Stackless arithmetic
+    /// carries none, so a mismatch would otherwise be lost here.
+    fn check_width(&self, oper: &Oper, width: IntType, id: usize) -> Result<()> {
+        let ty = self.local(id)?;
+        ensure!(
+            int_type_of(ty) == Some(width),
+            "{oper:?} is annotated {width:?}, but l{id} is `{}`",
+            self.show(ty)
+        );
+        Ok(())
+    }
+
+    fn show(&self, ty: &Type) -> String {
+        ty.display(&self.env.get_type_display_ctx()).to_string()
     }
 
     fn block(&self, id: usize) -> Result<&Block> {
@@ -1663,22 +1706,25 @@ impl FunctionTranslator<'_> {
 
     fn operation(&self, dsts: &[usize], oper: &Oper, srcs: &[usize]) -> Result<StacklessOperation> {
         Ok(match oper {
-            Oper::Add(_)
-            | Oper::Sub(_)
-            | Oper::Mul(_)
-            | Oper::Div(_)
-            | Oper::Mod(_)
-            | Oper::BitAnd(_)
-            | Oper::BitOr(_)
-            | Oper::BitXor(_)
-            | Oper::Shl(_)
-            | Oper::Shr(_)
-            | Oper::Lt
-            | Oper::Le
-            | Oper::Eq
-            | Oper::And
-            | Oper::Or => {
+            Oper::Add(width)
+            | Oper::Sub(width)
+            | Oper::Mul(width)
+            | Oper::Div(width)
+            | Oper::Mod(width)
+            | Oper::BitAnd(width)
+            | Oper::BitOr(width)
+            | Oper::BitXor(width)
+            | Oper::Shl(width)
+            | Oper::Shr(width) => {
                 arity(dsts, srcs, 1, 2, oper)?;
+                // Operands and result share the annotated type, except a
+                // shift's amount, which is a `u8` the annotation does not cover.
+                let is_shift = matches!(oper, Oper::Shl(_) | Oper::Shr(_));
+                self.check_width(oper, *width, srcs[0])?;
+                self.check_width(oper, *width, dsts[0])?;
+                if !is_shift {
+                    self.check_width(oper, *width, srcs[1])?;
+                }
                 match oper {
                     Oper::Add(_) => StacklessOperation::Add,
                     Oper::Sub(_) => StacklessOperation::Sub,
@@ -1690,6 +1736,12 @@ impl FunctionTranslator<'_> {
                     Oper::BitXor(_) => StacklessOperation::Xor,
                     Oper::Shl(_) => StacklessOperation::Shl,
                     Oper::Shr(_) => StacklessOperation::Shr,
+                    _ => unreachable!(),
+                }
+            },
+            Oper::Lt | Oper::Le | Oper::Eq | Oper::And | Oper::Or => {
+                arity(dsts, srcs, 1, 2, oper)?;
+                match oper {
                     Oper::Lt => StacklessOperation::Lt,
                     Oper::Le => StacklessOperation::Le,
                     Oper::Eq => StacklessOperation::Eq,
@@ -1700,6 +1752,8 @@ impl FunctionTranslator<'_> {
             },
             Oper::Cast(target) => {
                 arity(dsts, srcs, 1, 1, oper)?;
+                // A cast's width names its result, not its operand.
+                self.check_width(oper, *target, dsts[0])?;
                 match target {
                     IntType::U8 => StacklessOperation::CastU8,
                     IntType::U16 => StacklessOperation::CastU16,
@@ -2999,6 +3053,124 @@ mod tests {
 
     fn load_instruction(instr: Instr) -> Result<()> {
         import_module(&instruction_module(instr)).map(|_| ())
+    }
+
+    fn two_operand_ops(width: IntType) -> Vec<Oper> {
+        vec![
+            Oper::Add(width),
+            Oper::Sub(width),
+            Oper::Mul(width),
+            Oper::Div(width),
+            Oper::Mod(width),
+            Oper::BitAnd(width),
+            Oper::BitOr(width),
+            Oper::BitXor(width),
+        ]
+    }
+
+    #[test]
+    fn a_consistent_width_annotation_loads() {
+        let mut cases: Vec<(Vec<usize>, Oper, Vec<usize>)> = two_operand_ops(IntType::U64)
+            .into_iter()
+            .map(|oper| (vec![2], oper, vec![0, 1]))
+            .collect();
+        cases.extend([
+            // A shift's amount is a `u8` the annotation does not describe.
+            (vec![2], Oper::Shl(IntType::U64), vec![0, 3]),
+            (vec![2], Oper::Shr(IntType::U64), vec![0, 3]),
+            // A cast's annotation names its result; the operand may be any width.
+            (vec![3], Oper::Cast(IntType::U8), vec![0]),
+            (vec![0], Oper::Cast(IntType::U64), vec![3]),
+        ]);
+        let rejected: Vec<_> = cases
+            .into_iter()
+            .filter_map(|(dsts, oper, srcs)| {
+                load_instruction(Instr::Call(dsts, oper.clone(), srcs))
+                    .err()
+                    .map(|error| format!("{oper:?}: {error:#}"))
+            })
+            .collect();
+        assert!(rejected.is_empty(), "rejected: {rejected:#?}");
+    }
+
+    #[test]
+    fn a_width_annotation_must_match_the_locals() {
+        let mut cases: Vec<(Vec<usize>, Oper, Vec<usize>)> = two_operand_ops(IntType::I64)
+            .into_iter()
+            .map(|oper| (vec![2], oper, vec![0, 1]))
+            .collect();
+        cases.extend([
+            (vec![2], Oper::Add(IntType::U64), vec![4, 1]), // first operand
+            (vec![2], Oper::Add(IntType::U64), vec![0, 4]), // second operand
+            (vec![3], Oper::Add(IntType::U64), vec![0, 1]), // destination
+            (vec![2], Oper::Shl(IntType::U64), vec![3, 3]), // shl value
+            (vec![2], Oper::Shr(IntType::U64), vec![3, 3]), // shr value
+            (vec![0], Oper::Cast(IntType::U8), vec![3]),    // cast result
+        ]);
+        let accepted: Vec<_> = cases
+            .into_iter()
+            .filter(|(dsts, oper, srcs)| {
+                load_instruction(Instr::Call(dsts.clone(), oper.clone(), srcs.clone())).is_ok()
+            })
+            .map(|(dsts, oper, srcs)| format!("{oper:?} {dsts:?} <- {srcs:?}"))
+            .collect();
+        assert!(accepted.is_empty(), "accepted: {accepted:?}");
+    }
+
+    /// Each integer width, with a local of that type: the matching annotation
+    /// loads and a neighbouring width does not. This pins every arm of
+    /// `int_type`, not just `u64`.
+    #[test]
+    fn every_width_is_checked_against_its_own_type() {
+        let widths = [
+            (3, IntType::U8, IntType::U16),
+            (5, IntType::U16, IntType::U32),
+            (6, IntType::U32, IntType::U64),
+            (0, IntType::U64, IntType::U128),
+            (7, IntType::U128, IntType::U256),
+            (8, IntType::U256, IntType::U8),
+        ];
+        let mut wrong = vec![];
+        for (local, width, neighbour) in widths {
+            let load =
+                |w| load_instruction(Instr::Call(vec![local], Oper::Add(w), vec![local, local]));
+            if load(width).is_err() {
+                wrong.push(format!("{width:?} over its own type was rejected"));
+            }
+            if load(neighbour).is_ok() {
+                wrong.push(format!("{neighbour:?} over {width:?} was accepted"));
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    /// An operand that is not an integer at all is rejected, whatever its kind.
+    #[test]
+    fn a_non_integer_operand_is_rejected() {
+        let accepted: Vec<_> = [4, 9, 10, 11, 12] // address, bool, vector, reference, struct
+            .into_iter()
+            .filter(|&operand| {
+                load_instruction(Instr::Call(vec![2], Oper::Add(IntType::U64), vec![
+                    operand, 1,
+                ]))
+                .is_ok()
+            })
+            .collect();
+        assert!(
+            accepted.is_empty(),
+            "accepted non-integer locals: {accepted:?}"
+        );
+    }
+
+    #[test]
+    fn a_width_mismatch_names_the_operation_and_the_local() {
+        let error = load_instruction(Instr::Call(vec![2], Oper::Div(IntType::I64), vec![0, 1]))
+            .unwrap_err();
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("Div(I64)") && message.contains("l0") && message.contains("`u64`"),
+            "{message}"
+        );
     }
 
     /// `<` on an integer is a native comparison and loads without the
