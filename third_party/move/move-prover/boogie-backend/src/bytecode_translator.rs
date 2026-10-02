@@ -92,6 +92,10 @@ macro_rules! bv_op_not_enabled_error {
     };
 }
 
+/// Local of an `$apply` procedure holding a guarded closure target's `requires_of` in the
+/// pre-state.
+const REQUIRES_OK_LOCAL: &str = "$requires_ok";
+
 /// Frame access kind for the apply procedure context, using Boogie-level address strings
 /// instead of Move `Exp` trees. This is used when emitting frame conditions in the
 /// `$apply` procedure body where addresses are Boogie variable references.
@@ -1264,6 +1268,18 @@ impl<'env> BoogieTranslator<'env> {
             }
         }
 
+        let any_guarded = closure_infos.iter().any(|info| {
+            let fun_env = self.env.get_function(info.fun.to_qualified_id());
+            let has_inline = mono_info
+                .funs
+                .get(&(info.fun.to_qualified_id(), FunctionVariant::Baseline))
+                .is_some_and(|insts| !insts.is_empty());
+            (fun_env.is_opaque() || !has_inline) && Self::has_requires(&fun_env)
+        });
+        if any_guarded {
+            emitln!(self.writer, "var {}: bool;", REQUIRES_OK_LOCAL);
+        }
+
         // Generate branches for all variants. Since the datatype is closed,
         // the last variant uses `else` without an explicit check (unless it's the only variant,
         // in which case we emit the body directly without any block).
@@ -1311,7 +1327,24 @@ impl<'env> BoogieTranslator<'env> {
                 .get(&(info.fun.to_qualified_id(), FunctionVariant::Baseline))
                 .map(|insts| !insts.is_empty())
                 .unwrap_or(false);
-            if fun_env.is_opaque() || !has_inline {
+            let is_opaque_variant = fun_env.is_opaque() || !has_inline;
+            // An opaque target's abort condition and frame hold only under its `requires`;
+            // when it fails, the invocation's outcome is unknown. A transparent target's
+            // body assumes nothing and needs no guard.
+            let guarded = is_opaque_variant && Self::has_requires(fun_env);
+            if guarded {
+                let (_, bp_args, _, _) = self.closure_behavioral_args(info, idx, fun_env);
+                let requires_name =
+                    boogie_behavioral_fun_spec_name(self.env, &info.fun, BehaviorKind::RequiresOf);
+                emitln!(
+                    self.writer,
+                    "{} := {}({});",
+                    REQUIRES_OK_LOCAL,
+                    requires_name,
+                    bp_args
+                );
+            }
+            if is_opaque_variant {
                 self.emit_opaque_closure_body(
                     info,
                     idx,
@@ -1320,6 +1353,7 @@ impl<'env> BoogieTranslator<'env> {
                     results,
                     &result_locals,
                     memory,
+                    guarded.then_some(REQUIRES_OK_LOCAL),
                 );
             } else {
                 emitln!(self.writer, "call {}{}({});", call_prefix, fun_name, args);
@@ -1419,6 +1453,7 @@ impl<'env> BoogieTranslator<'env> {
                 &params,
                 memory,
                 &frame_access,
+                None,
             );
             if is_only {
                 // Single variant: no outer block to close
@@ -1516,6 +1551,7 @@ impl<'env> BoogieTranslator<'env> {
                 &params,
                 memory,
                 &frame_access,
+                None,
             );
             if is_only {
                 // Single variant: no outer block to close
@@ -1584,9 +1620,65 @@ impl<'env> BoogieTranslator<'env> {
         results: &Type,
         result_locals: &[String],
         memory: &[(QualifiedInstId<StructId>, String)],
+        requires_guard: Option<&str>,
     ) {
-        // Build args for ALL callee params by interleaving captured and non-captured
-        // using ClosureMask::compose.
+        let (bp_arg_list, bp_args, inst_used, inst_old) =
+            self.closure_behavioral_args(info, variant_idx, fun_env);
+
+        let aborts_name =
+            boogie_behavioral_fun_spec_name(self.env, &info.fun, BehaviorKind::AbortsOf);
+        let ensures_name =
+            boogie_behavioral_fun_spec_name(self.env, &info.fun, BehaviorKind::EnsuresOf);
+        let result_fun_name = boogie_behavioral_fun_result_name(self.env, &info.fun, false);
+        let multi_result_fun_name = boogie_behavioral_fun_result_name(self.env, &info.fun, true);
+        let explicit_results = results.clone().flatten();
+
+        // Compute frame access for this closure
+        let frame_access_raw = derive_closure_frame_access(fun_env, &info.fun.inst);
+        let frame_access = self.closure_frame_to_apply_frame(&frame_access_raw, &bp_arg_list);
+
+        // Get spec memory for building post-state args
+        self.emit_behavioral_predicate_body(
+            &aborts_name,
+            &ensures_name,
+            &bp_args,
+            &result_fun_name,
+            &multi_result_fun_name,
+            &bp_arg_list,
+            &inst_used,
+            &inst_old,
+            result_locals,
+            &explicit_results,
+            params,
+            memory,
+            &frame_access,
+            requires_guard,
+        );
+    }
+
+    /// Whether a function's spec has a `requires`.
+    fn has_requires(fun_env: &FunctionEnv) -> bool {
+        fun_env
+            .get_spec()
+            .conditions
+            .iter()
+            .any(|c| matches!(c.kind, ConditionKind::Requires))
+    }
+
+    /// Arguments of a closure target's behavioral predicates inside `$apply`: the target's
+    /// parameters in its own order (captured and non-captured interleaved), the argument
+    /// string with the pre-state memory prepended, and the memory sets it is built from.
+    fn closure_behavioral_args(
+        &self,
+        info: &ClosureInfo,
+        variant_idx: usize,
+        fun_env: &FunctionEnv,
+    ) -> (
+        Vec<String>,
+        String,
+        BTreeSet<QualifiedInstId<StructId>>,
+        BTreeSet<QualifiedInstId<StructId>>,
+    ) {
         let captured_args: Vec<String> = (0..info.mask.captured_count())
             .map(|pos| format!("fun->p{}_v{}", pos, variant_idx))
             .collect();
@@ -1618,35 +1710,7 @@ impl<'env> BoogieTranslator<'env> {
         let inst_old = behavioral_old_memory_instantiated(fun_env, &info.fun.inst);
         let fun_mem_args = self.build_spec_memory_args(&inst_used, &inst_old, &[], &None, None);
         let bp_args = fun_mem_args.iter().chain(bp_arg_list.iter()).join(", ");
-
-        let aborts_name =
-            boogie_behavioral_fun_spec_name(self.env, &info.fun, BehaviorKind::AbortsOf);
-        let ensures_name =
-            boogie_behavioral_fun_spec_name(self.env, &info.fun, BehaviorKind::EnsuresOf);
-        let result_fun_name = boogie_behavioral_fun_result_name(self.env, &info.fun, false);
-        let multi_result_fun_name = boogie_behavioral_fun_result_name(self.env, &info.fun, true);
-        let explicit_results = results.clone().flatten();
-
-        // Compute frame access for this closure
-        let frame_access_raw = derive_closure_frame_access(fun_env, &info.fun.inst);
-        let frame_access = self.closure_frame_to_apply_frame(&frame_access_raw, &bp_arg_list);
-
-        // Get spec memory for building post-state args
-        self.emit_behavioral_predicate_body(
-            &aborts_name,
-            &ensures_name,
-            &bp_args,
-            &result_fun_name,
-            &multi_result_fun_name,
-            &bp_arg_list,
-            &inst_used,
-            &inst_old,
-            result_locals,
-            &explicit_results,
-            params,
-            memory,
-            &frame_access,
-        );
+        (bp_arg_list, bp_args, inst_used, inst_old)
     }
 
     /// Convert `FrameAccessKind` (with Exp-level addresses) to `ApplyFrameAccess`
@@ -1753,6 +1817,7 @@ impl<'env> BoogieTranslator<'env> {
         params: &[Type],
         memory: &[(QualifiedInstId<StructId>, String)],
         frame_access: &BTreeMap<QualifiedInstId<StructId>, ApplyFrameAccess>,
+        requires_guard: Option<&str>,
     ) {
         let env = self.env;
         let explicit_result_count = explicit_results.len();
@@ -1762,7 +1827,6 @@ impl<'env> BoogieTranslator<'env> {
             .filter(|(_, p)| p.is_mutable_reference())
             .map(|(idx, _)| idx)
             .collect();
-        let first_mut_ref_param = mut_ref_param_indices.first().copied();
 
         // Compute which memory names are covered by frame_access
         let covered_by_frame: BTreeSet<String> = frame_access
@@ -1771,12 +1835,42 @@ impl<'env> BoogieTranslator<'env> {
             .collect();
 
         // Phase 1: Check abort condition using pre-state args (both old and current are pre-state)
-        emitln!(self.writer, "if ({}({})) {{", aborts_name, bp_args);
+        // With a `requires_guard` (a local holding the target's `requires_of` in the
+        // pre-state), the abort condition, frame and ensures apply only when it holds;
+        // otherwise abort and memory are unknown. Results stay the target's result
+        // function of its pre- and post-state, which execution determines either way.
+        let guard_prefix = requires_guard
+            .map(|g| format!("{} && ", g))
+            .unwrap_or_default();
+        emitln!(
+            self.writer,
+            "if ({}{}({})) {{",
+            guard_prefix,
+            aborts_name,
+            bp_args
+        );
         self.writer.indent();
         emitln!(self.writer, "$abort_flag := true;");
         self.writer.unindent();
         emitln!(self.writer, "} else {");
         self.writer.indent();
+        if let Some(g) = requires_guard {
+            // Results come from the pre-state, where the result function's axiom finds the
+            // target's `requires_of` false and adds nothing.
+            emitln!(self.writer, "if (!{}) {{", g);
+            self.writer.indent();
+            emitln!(self.writer, "havoc $abort_flag, $abort_code;");
+            self.emit_result_assignments(
+                result_locals,
+                explicit_results,
+                &mut_ref_param_indices,
+                result_fun_name,
+                multi_result_fun_name,
+                bp_args,
+            );
+            self.writer.unindent();
+            emitln!(self.writer, "}");
+        }
 
         // Phase 2: Save pre-state, havoc, frame conditions, assign results, assume ensures
 
@@ -1821,6 +1915,10 @@ impl<'env> BoogieTranslator<'env> {
             emitln!(self.writer, "havoc {};", mem_name)
         }
 
+        if let Some(g) = requires_guard {
+            emitln!(self.writer, "if ({}) {{", g);
+            self.writer.indent();
+        }
         // Emit Reads constraints for memory types not in frame_access.
         // These are memory types that this variant provably doesn't modify,
         // so they must be preserved after havoc.
@@ -1870,6 +1968,10 @@ impl<'env> BoogieTranslator<'env> {
                 ApplyFrameAccess::WritesAll => unreachable!(),
             }
         }
+        if requires_guard.is_some() {
+            self.writer.unindent();
+            emitln!(self.writer, "}");
+        }
 
         // Build post-state args: old slots use saved pre-state, current slots use post-havoc
         let post_mem_args = self.build_spec_memory_args(
@@ -1886,81 +1988,21 @@ impl<'env> BoogieTranslator<'env> {
         let result_bp_args = post_mem_args.iter().chain(data_args.iter()).join(", ");
 
         // Assign results using result_of function (now using post-state args)
-        if !result_locals.is_empty() {
-            if result_locals.len() == 1 {
-                let result_local = &result_locals[0];
-                if explicit_result_count == 1 {
-                    if explicit_results[0].is_mutable_reference() {
-                        let base_param = first_mut_ref_param.unwrap_or(0);
-                        emitln!(
-                            self.writer,
-                            "{} := $ChildMutation(p{}, -1, {}({}));",
-                            result_local,
-                            base_param,
-                            result_fun_name,
-                            result_bp_args
-                        );
-                    } else {
-                        emitln!(
-                            self.writer,
-                            "{} := {}({});",
-                            result_local,
-                            result_fun_name,
-                            result_bp_args
-                        );
-                    }
-                } else {
-                    // Mutable reference param output: wrap in $UpdateMutation
-                    let param_idx = mut_ref_param_indices[0];
-                    emitln!(
-                        self.writer,
-                        "{} := $UpdateMutation(p{}, {}({}));",
-                        result_local,
-                        param_idx,
-                        result_fun_name,
-                        result_bp_args
-                    );
-                }
-            } else {
-                // Multiple results: use tuple projection
-                for (i, result_local) in result_locals.iter().enumerate() {
-                    if i < explicit_result_count {
-                        if explicit_results[i].is_mutable_reference() {
-                            let base_param = first_mut_ref_param.unwrap_or(0);
-                            emitln!(
-                                self.writer,
-                                "{} := $ChildMutation(p{}, -1, {}({})->${});",
-                                result_local,
-                                base_param,
-                                multi_result_fun_name,
-                                result_bp_args,
-                                i
-                            );
-                        } else {
-                            emitln!(
-                                self.writer,
-                                "{} := {}({})->${};",
-                                result_local,
-                                multi_result_fun_name,
-                                result_bp_args,
-                                i
-                            );
-                        }
-                    } else {
-                        let mut_ref_idx = i - explicit_result_count;
-                        let param_idx = mut_ref_param_indices[mut_ref_idx];
-                        emitln!(
-                            self.writer,
-                            "{} := $UpdateMutation(p{}, {}({})->${});",
-                            result_local,
-                            param_idx,
-                            multi_result_fun_name,
-                            result_bp_args,
-                            i
-                        );
-                    }
-                }
-            }
+        if let Some(g) = requires_guard {
+            emitln!(self.writer, "if ({}) {{", g);
+            self.writer.indent();
+        }
+        self.emit_result_assignments(
+            result_locals,
+            explicit_results,
+            &mut_ref_param_indices,
+            result_fun_name,
+            multi_result_fun_name,
+            &result_bp_args,
+        );
+        if requires_guard.is_some() {
+            self.writer.unindent();
+            emitln!(self.writer, "}");
         }
 
         // Build result args for ensures_of, dereferencing mutable reference results.
@@ -1985,10 +2027,107 @@ impl<'env> BoogieTranslator<'env> {
             (true, false) => ensures_result_args.join(", "),
             (false, false) => format!("{}, {}", result_bp_args, ensures_result_args.join(", ")),
         };
-        emitln!(self.writer, "assume {}({});", ensures_name, ensures_args);
+        emitln!(
+            self.writer,
+            "assume {}{}({});",
+            requires_guard
+                .map(|g| format!("{} ==> ", g))
+                .unwrap_or_default(),
+            ensures_name,
+            ensures_args
+        );
 
         self.writer.unindent();
         emitln!(self.writer, "}");
+    }
+
+    /// Assigns an `$apply` variant's result locals from the target's result function applied
+    /// to `result_args`: explicit results first, then the `&mut` parameter outputs.
+    fn emit_result_assignments(
+        &self,
+        result_locals: &[String],
+        explicit_results: &[Type],
+        mut_ref_param_indices: &[usize],
+        result_fun_name: &str,
+        multi_result_fun_name: &str,
+        result_args: &str,
+    ) {
+        if !result_locals.is_empty() {
+            if result_locals.len() == 1 {
+                let result_local = &result_locals[0];
+                if explicit_results.len() == 1 {
+                    if explicit_results[0].is_mutable_reference() {
+                        let base_param = mut_ref_param_indices.first().copied().unwrap_or(0);
+                        emitln!(
+                            self.writer,
+                            "{} := $ChildMutation(p{}, -1, {}({}));",
+                            result_local,
+                            base_param,
+                            result_fun_name,
+                            result_args
+                        );
+                    } else {
+                        emitln!(
+                            self.writer,
+                            "{} := {}({});",
+                            result_local,
+                            result_fun_name,
+                            result_args
+                        );
+                    }
+                } else {
+                    // Mutable reference param output: wrap in $UpdateMutation
+                    let param_idx = mut_ref_param_indices[0];
+                    emitln!(
+                        self.writer,
+                        "{} := $UpdateMutation(p{}, {}({}));",
+                        result_local,
+                        param_idx,
+                        result_fun_name,
+                        result_args
+                    );
+                }
+            } else {
+                // Multiple results: use tuple projection
+                for (i, result_local) in result_locals.iter().enumerate() {
+                    if i < explicit_results.len() {
+                        if explicit_results[i].is_mutable_reference() {
+                            let base_param = mut_ref_param_indices.first().copied().unwrap_or(0);
+                            emitln!(
+                                self.writer,
+                                "{} := $ChildMutation(p{}, -1, {}({})->${});",
+                                result_local,
+                                base_param,
+                                multi_result_fun_name,
+                                result_args,
+                                i
+                            );
+                        } else {
+                            emitln!(
+                                self.writer,
+                                "{} := {}({})->${};",
+                                result_local,
+                                multi_result_fun_name,
+                                result_args,
+                                i
+                            );
+                        }
+                    } else {
+                        let mut_ref_idx = i - explicit_results.len();
+                        let param_idx = mut_ref_param_indices[mut_ref_idx];
+                        emitln!(
+                            self.writer,
+                            "{} := $UpdateMutation(p{}, {}({})->${});",
+                            result_local,
+                            param_idx,
+                            multi_result_fun_name,
+                            result_args,
+                            i
+                        );
+                    }
+                }
+            }
+        }
     }
 
     /// Generate a behavioral predicate evaluator for a function type.
